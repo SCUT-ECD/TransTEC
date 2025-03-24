@@ -1,0 +1,183 @@
+import numpy as np
+import pandas as pd
+from scipy.optimize import differential_evolution
+
+# Define the range of years to process
+years = [2020,2025,2030,2035,2040,2045]
+
+# Load the 'target_ptprobs' sheet from the Excel file (adjust the path if needed)
+target_ptprobs_df = pd.read_excel('tt_vehicle_represent_params_tractormix.xlsx', sheet_name='target_ptprobs_l', index_col=0)
+
+# Initialize the Excel writer to save results to the same Excel file
+output_file_path = 'final_probabilities_merged_with_categories05.xlsx'
+
+# Ensure that at least one sheet is created before saving the workbook
+with pd.ExcelWriter(output_file_path, engine='openpyxl') as writer:
+    # Create at least one visible sheet if no sheets exist
+    if not writer.book.sheetnames:
+        # Create a dummy sheet to ensure there's at least one visible sheet
+        dummy_df = pd.DataFrame({'Dummy': [1]})
+        dummy_df.to_excel(writer, sheet_name='Sheet1')
+
+    for year in years:
+        # Load the corresponding year's data
+        temp_costoutput_file_path = f'comtt_annual_cost35.xlsx'  # Adjust the filename format if necessary
+        df = pd.read_excel(temp_costoutput_file_path, sheet_name=str(year), engine='openpyxl')
+
+        # Column names
+        tco_col = 'TCO'
+        powertrain_col = '动力系统'
+
+        # Define the vehicle categories and their powertrains
+        traditional_vehicles = ['DICE', 'NGICE']
+        electric_vehicles = [ 'BEVF423','BEVF729', 'BEVE512']
+        hybrid_vehicles = ['PHEV']
+        low_carbon_vehicles = ['FCEV','MICE','H2ICE70']
+
+        # Combine all categories into a dictionary
+        vehicle_categories = {
+            'Traditional_Vehicles': traditional_vehicles,
+            'Electric_Vehicles': electric_vehicles,
+            'Hybrid_Vehicles': hybrid_vehicles,
+            'Low_Carbon_Vehicles': low_carbon_vehicles
+        }
+
+        # β values for each powertrain
+        betas = {
+            'DICE': -0.5, 'NGICE': -0.5,
+            'BEVF282': -0.36, 'BEVE282': -0.36, 'BEVF423': -0.36, 'BEVE512':-0.36, 'BEVF729': -0.36,
+            'PHEV': -0.8,
+            'FCEV':-0.36,'MICE': -0.36,'H2ICE70': -0.36,
+        }
+
+
+        # Get the target_ptprobs for the current year from Excel (assuming the first column contains the years)
+        def get_target_ptprobs_for_year(year):
+            return target_ptprobs_df.loc[year].to_dict()
+
+
+        # Retrieve the target_ptprobs for the current year
+        target_ptprobs = get_target_ptprobs_for_year(year)
+
+
+        # Define helper functions
+        def get_beta_for_powertrain(powertrain):
+            return betas.get(powertrain, None)
+
+
+        def calculate_probabilities(tcos, betas_dict, adjustment_factors):
+            exp_tcos = np.exp([betas_dict[pt] * (tcos[pt] + adjustment_factors.get(pt, 0)) * 1e-4 for pt in tcos])
+            sum_exp_tcos = np.sum(exp_tcos)
+            probabilities = {pt: exp_tcos[i] / sum_exp_tcos for i, pt in enumerate(tcos)}
+            return probabilities
+
+
+        def objective_function(cis, tcos, betas_dict, target_probs, powertrains):
+            adjustment_factors = {pt: cis[i] for i, pt in enumerate(powertrains)}
+            probabilities = calculate_probabilities(tcos, betas_dict, adjustment_factors)
+
+            # Calculate errors for each powertrain
+            errors = {pt: abs(probabilities.get(pt, 0) - target_probs.get(pt, 0)) for pt in powertrains}
+
+            # Total error as the maximum of individual errors
+            max_error = max(errors.values())
+
+            # Add penalty for errors above the threshold
+            threshold = 0.001
+            penalty =sum( (error - threshold) * 0.5 for error in errors.values() if error > threshold)
+
+            return max_error + penalty
+
+
+        def find_best_Ci(tcos, betas_dict, target_probs, powertrains):
+            bounds = [(-5000000, 5000000)] * len(powertrains)  # Bounds for each c_i
+
+            # Use differential evolution for global optimization
+            result = differential_evolution(objective_function, bounds,
+                                            args=(tcos, betas_dict, target_probs, powertrains),
+                                            strategy='best1bin', maxiter=9000, tol=1e-4, updating='deferred')
+
+            best_cis = result.x
+            max_error = result.fun
+            probabilities = calculate_probabilities(tcos, betas_dict,
+                                                    {pt: best_cis[i] for i, pt in enumerate(powertrains)})
+
+
+
+            return {pt: best_cis[i] for i, pt in enumerate(powertrains)}, max_error, probabilities
+
+
+        all_results = []
+
+        # Iterate through the dataframe in steps of 17 rows
+        for i in range(0, len(df), 9):
+            df_subset = df.iloc[i:i + 9]
+
+            # Iterate through each vehicle category
+            for category, powertrains in vehicle_categories.items():
+                # Get TCO values for all powertrains in this category
+                tcos = {}
+                for pt in powertrains:
+                    matching_rows = df_subset[df_subset[powertrain_col] == pt]
+                    if not matching_rows.empty:
+                        tcos[pt] = matching_rows[tco_col].values[0]
+                    else:
+                        # Skip this powertrain if no matching row is found, and print a detailed message
+                        print(
+                            f"No matching row found for powertrain '{pt}' in category '{category}' for Owner ID {i // 13 + 1}")
+                        continue  # Skip to the next powertrain
+
+                # Ensure there are valid TCOs to continue processing
+                if not tcos:
+                    print(f"Skipping category '{category}' for Owner ID {i // 9 + 1} due to missing data.")
+                    continue
+
+
+                betas_dict = {pt: get_beta_for_powertrain(pt) for pt in powertrains}
+                target_probs = {pt: target_ptprobs.get(pt, None) for pt in powertrains}
+
+
+                # Fix 'best_Ci' for specific powertrains (if applicable)
+                fixed_powertrains = ['DICE', 'BEVF423', 'PHEV', 'FCEV']
+                best_cis = {pt: 0 for pt in fixed_powertrains if pt in powertrains}
+
+
+                # Now proceed with finding the best_Ci for the other powertrains
+                optimized_powertrains = [pt for pt in powertrains if pt not in fixed_powertrains]
+                if optimized_powertrains:
+                    optimized_best_cis, max_error, best_probabilities = find_best_Ci(tcos, betas_dict, target_probs,
+                                                                                     optimized_powertrains)
+                    best_cis.update(optimized_best_cis)  # Combine the results
+                else:
+                    max_error = 0
+                    best_probabilities = {pt: target_probs[pt] for pt in powertrains}
+
+                # Append results to the list
+                for pt in powertrains:
+                    all_results.append({
+                        'Owner_ID': i // 9 + 1,  # Owner ID based on the subset index
+                        '动力系统': pt,
+                        'Updated_Probability': best_probabilities[pt],
+                        'Target_Probability': target_probs[pt],
+                        'Best_Ci': best_cis[pt],
+                        'Max_Error': max_error,
+                        'Category': category
+                    })
+
+        # Convert results to DataFrame
+        results_df = pd.DataFrame(all_results)
+
+        # Ensure column names are consistent for merging
+        results_df.rename(columns={'动力系统': powertrain_col}, inplace=True)
+
+        # Merge results with the original data
+        df['Owner_ID'] = (df.index // 9) + 1  # Create Owner_ID based on row index
+        merged_df = pd.merge(df, results_df, on=['Owner_ID', powertrain_col], how='left')
+
+        # Save the merged DataFrame to the corresponding sheet in the Excel file
+        merged_df.to_excel(writer, sheet_name=f'{year}', index=False)
+
+        print(f"Calibration complete. Results saved in '{output_file_path}'.")
+
+
+
