@@ -1,0 +1,144 @@
+import pandas as pd
+import numpy as np
+from scipy.optimize import differential_evolution
+
+# Define the range of years to process
+years = [2020,2025,2030,2035,2040,2045]
+
+# Load the 'Target_Probability' sheet from the Excel file (adjust the path if needed)
+target_prob_df = pd.read_excel('tt_vehicle_represent_params_tractormix.xlsx', sheet_name='Target_Probability_l', index_col=0)
+
+# Initialize the Excel writer to save results to the same Excel file
+output_file_path = 'output_results05.xlsx'
+with pd.ExcelWriter(output_file_path, engine='openpyxl') as writer:
+
+    for year in years:
+        # Load the corresponding year's data
+        input_file_path = f'final_probabilities_merged_with_categories05.xlsx'  # Adjust the filename format if necessary
+        df = pd.read_excel(input_file_path,sheet_name=str(year),engine='openpyxl')
+
+
+        # Column names
+        tco_col = 'TCO'
+        powertrain_col = '动力系统'
+        bestci_col = 'Best_Ci'
+
+        # β values for each powertrain
+        betas = {
+            '传统车型': -1.1,
+            '电动车型': -0.7,
+            '混动车型': -0.8,
+            '低碳车型': -0.52,
+            'DICE': -0.5, 'NGICE': -0.5,
+            'BEVF282': -0.36, 'BEVE282': -0.36, 'BEVF423': -0.36, 'BEVE512': -0.36, 'BEVF729': -0.36,
+            'PHEV': -0.8,
+            'FCEV': -0.36, 'MICE': -0.36, 'H2ICE70': -0.36}
+
+        # 大类与其动力系统的映射关系
+        category_mapping = {
+            '传统车型':  ['DICE', 'NGICE'],
+            '电动车型': ['BEVF423','BEVF729', 'BEVE512'],
+            '混动车型': ['PHEV'],
+            '低碳车型':  ['FCEV','MICE','H2ICE70']
+
+        }
+
+        # Get the target probabilities for the current year from the Excel file
+        Target_Probability = target_prob_df.loc[year].to_dict()
+
+        # 计算大类的TCO
+        def calculate_category_tco(df, category_mapping, betas, adjustment_factors):
+            category_tcos = {}
+            for category, powertrains in category_mapping.items():
+                exp_sum = 0
+                for pt in powertrains:
+                    tco_value =(df.loc[df[powertrain_col] == pt, tco_col].values + df.loc[
+                        df[powertrain_col] == pt, bestci_col].values +adjustment_factors[category])
+                    beta_value = betas[pt] * tco_value * 1e-4
+                    exp_sum += np.exp(beta_value)
+                category_tco = np.log(exp_sum) / betas[category]*1e4
+                category_tcos[category] = category_tco
+            return category_tcos
+
+        # 计算大类的选择概率
+        def calculate_probabilities(category_tcos, betas):
+            exp_values = {}
+            for cat, tco in category_tcos.items():
+                beta_tco_product = betas[cat] * tco*1e-4
+                exp_value = np.exp(beta_tco_product)
+                exp_values[cat] = exp_value
+
+            total_exp = sum(exp_values.values())
+            probabilities = {cat: exp_val / total_exp for cat, exp_val in exp_values.items()}
+            return probabilities
+
+        def find_best_Ci(df, betas, target_probs):
+            fixed_category = '传统车型'
+            other_categories = [cat for cat in category_mapping.keys() if cat != fixed_category]
+
+            # Fix the best_cis for '传统车型'
+            best_cis = {fixed_category: 0}
+            bounds = [(-5000000, 5000000)]* len(category_mapping.keys())  # Bounds for each c_i
+
+            def objective_function(cis, df, betas, target_probs):
+                adjustment_factors = {cat: cis[i] for i, cat in enumerate(other_categories)}
+                adjustment_factors[fixed_category] = 0  # '传统车型' remains fixed at 0
+                category_tcos = calculate_category_tco(df, category_mapping, betas, adjustment_factors)
+                probabilities = calculate_probabilities(category_tcos, betas)
+
+                # Calculate errors for each category
+                errors = {cat: abs(probabilities[cat] - target_probs.get(cat, 0)) for cat in probabilities}
+                max_error = max(errors.values())
+                return max_error
+
+            # Use differential evolution for global optimization
+            result = differential_evolution(objective_function, bounds, args=(df, betas, target_probs),
+                                            strategy='best1bin', maxiter=1000, tol=1e-4, updating='deferred')
+
+            optimized_best_cis = result.x
+            max_error = result.fun
+
+            # Add optimized best_cis for non-fixed categories
+            best_cis.update({cat: optimized_best_cis[i] for i, cat in enumerate(other_categories)})
+
+            # Calculate final TCO and probabilities
+            adjustment_factors = best_cis
+            category_tcos = calculate_category_tco(df, category_mapping, betas, adjustment_factors)
+            probabilities = calculate_probabilities(category_tcos, betas)
+
+            return adjustment_factors, max_error, probabilities
+
+        # 对每17行数据进行独立校正
+        num_owners = len(df) // 9
+        final_results = []
+
+        for i in range(num_owners):
+            df_owner = df.iloc[i * 9:(i + 1) * 9].copy()
+            adjustment_factors, max_error, best_probabilities = find_best_Ci(df_owner, betas, Target_Probability)
+
+            # 将结果添加到列表中以便后续保存
+            final_results.append({
+                'Owner': i + 1,
+                'Adjustment_Factors': adjustment_factors,
+                'Max_Error': max_error,
+                'Probabilities': best_probabilities
+            })
+
+        # 转换为DataFrame并保存到Excel文件中
+        output_data = []
+        for result in final_results:
+            for category, prob in result['Probabilities'].items():
+                output_data.append({
+                    'Owner': result['Owner'],
+                    'Category': category,
+                    'Adjustment_Factor': result['Adjustment_Factors'][category],
+                    'Probability': prob,
+                    'Max_Error': result['Max_Error']
+                })
+
+        output_df = pd.DataFrame(output_data)
+
+        # Save the results to a new sheet in the Excel file
+        output_df.to_excel(writer, sheet_name=f'{year}', index=False)
+
+print(f"Results saved to {output_file_path}")
